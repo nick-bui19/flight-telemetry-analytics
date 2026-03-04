@@ -2,99 +2,148 @@
 
 # Real-Time Flight Telemetry Dashboard Startup Script
 
-# Source .env if present
+# Source .env before cd so dirname "$0" is still correct
 if [ -f "$(dirname "$0")/.env" ]; then
     set -a
     source "$(dirname "$0")/.env"
     set +a
 fi
 
-echo "Starting Real-Time Flight Telemetry Dashboard..."
-echo "=================================================="
-
-# Set working directory
+# Set working directory — all relative paths below assume project root
 cd "$(dirname "$0")"
 
-# Default MODE
+mkdir -p logs
+
 MODE="${MODE:-simulator}"
+KAFKA_BS="${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}"
+POSTGRES_USER="${POSTGRES_USER:-nickbui}"
+POSTGRES_DB="${POSTGRES_DB:-flight_data}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-8501}"
+
+PRODUCER_PID=""
+SPARK_PID=""
+
+# ── Cleanup (runs on Ctrl+C or exit) ──────────────────────────────────────────
+cleanup() {
+    echo ""
+    echo "Shutting down services..."
+    [ -n "$PRODUCER_PID" ] && kill "$PRODUCER_PID" 2>/dev/null
+    [ -n "$SPARK_PID" ]    && kill "$SPARK_PID"    2>/dev/null
+    cd kafka-setup && docker-compose down --timeout 10
+    echo "All services stopped."
+}
+trap cleanup INT TERM EXIT
+
+echo "Starting Real-Time Flight Telemetry Dashboard..."
+echo "=================================================="
 echo "Mode: $MODE"
 
-# Activate virtual environment
-echo "Activating virtual environment..."
+# ── Virtual environment ────────────────────────────────────────────────────────
+echo "[1/7] Activating virtual environment..."
 source venv/bin/activate
 
-# Check if Docker is running
-echo "Checking Docker status..."
+# ── Docker ────────────────────────────────────────────────────────────────────
+echo "[2/7] Checking Docker..."
 if ! docker info > /dev/null 2>&1; then
-    echo "Docker is not running. Please start Docker Desktop."
-    open -a Docker
-    echo "Waiting for Docker to start (30 seconds)..."
-    sleep 30
-fi
-
-# Start Kafka infrastructure
-echo "Starting Kafka infrastructure..."
-cd kafka-setup
-docker-compose up -d
-sleep 10
-
-# Check Kafka status
-if docker ps | grep -q kafka; then
-    echo "Kafka is running"
-else
-    echo "Kafka may not be fully ready yet"
-fi
-
-cd ..
-
-# Check PostgreSQL connection
-echo "Checking PostgreSQL connection..."
-if psql -U "${POSTGRES_USER:-nickbui}" -d "${POSTGRES_DB:-flight_data}" -c "SELECT 1;" > /dev/null 2>&1; then
-    echo "PostgreSQL connection successful"
-else
-    echo "PostgreSQL connection failed. Please check if PostgreSQL is running and flight_data DB exists."
-    echo "Run: psql -U nickbui -c 'CREATE DATABASE flight_data;' && psql -U nickbui -d flight_data -f sql/init_flight_db.sql"
+    echo "Docker is not running. Please start Docker Desktop and re-run this script."
     exit 1
 fi
 
-# Start producer in background based on MODE
-if [ "$MODE" = "opensky" ]; then
-    echo "Starting OpenSky producer..."
-    python producers/opensky_producer.py &
-    PRODUCER_PID=$!
-    echo "OpenSky producer PID: $PRODUCER_PID"
-else
-    echo "Starting flight simulator..."
-    python producers/flight_simulator.py &
-    PRODUCER_PID=$!
-    echo "Simulator PID: $PRODUCER_PID"
+# ── Kafka ─────────────────────────────────────────────────────────────────────
+echo "[3/7] Starting Kafka..."
+cd kafka-setup
+docker-compose up -d
+cd ..
+
+echo "      Waiting for Kafka broker to accept connections (up to 60s)..."
+KAFKA_READY=0
+for i in $(seq 1 30); do
+    if python -c "
+from kafka import KafkaAdminClient
+KafkaAdminClient(bootstrap_servers='$KAFKA_BS', request_timeout_ms=2000).close()
+" 2>/dev/null; then
+        KAFKA_READY=1
+        break
+    fi
+    sleep 2
+done
+
+if [ "$KAFKA_READY" -eq 0 ]; then
+    echo "Kafka did not become ready within 60 seconds."
+    echo "Check: docker-compose -f kafka-setup/docker-compose.yml logs kafka"
+    exit 1
 fi
+echo "      Kafka is ready."
 
-# Start Spark streaming in background
-echo "Starting Spark streaming processor..."
-bash run_spark.sh &
+echo "      Ensuring topics exist..."
+KAFKA_CONTAINER=$(docker ps \
+    --filter "name=kafka" \
+    --filter "status=running" \
+    --format "{{.Names}}" | grep -v zookeeper | head -1)
+
+docker exec "$KAFKA_CONTAINER" kafka-topics.sh \
+    --bootstrap-server localhost:9092 \
+    --create --if-not-exists \
+    --topic flight-telemetry-v1 \
+    --partitions 1 --replication-factor 1 > /dev/null
+
+docker exec "$KAFKA_CONTAINER" kafka-topics.sh \
+    --bootstrap-server localhost:9092 \
+    --create --if-not-exists \
+    --topic flight-telemetry-dlq \
+    --partitions 1 --replication-factor 1 > /dev/null
+echo "      Topics ready."
+
+# ── PostgreSQL ─────────────────────────────────────────────────────────────────
+echo "[4/7] Checking PostgreSQL..."
+if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT 1;" > /dev/null 2>&1; then
+    echo "PostgreSQL connection failed."
+    echo "Make sure PostgreSQL is running and the flight_data database exists:"
+    echo "  psql -d postgres -U $POSTGRES_USER -c 'CREATE DATABASE $POSTGRES_DB;'"
+    echo "  psql -U $POSTGRES_USER -d $POSTGRES_DB -f sql/init_flight_db.sql"
+    exit 1
+fi
+echo "      PostgreSQL OK."
+
+# ── Producer ───────────────────────────────────────────────────────────────────
+echo "[5/7] Starting producer ($MODE mode)..."
+if [ "$MODE" = "opensky" ]; then
+    python -m producers.opensky_producer > logs/producer.log 2>&1 &
+else
+    python -m producers.flight_simulator > logs/producer.log 2>&1 &
+fi
+PRODUCER_PID=$!
+echo "      PID: $PRODUCER_PID  |  tail -f logs/producer.log"
+
+sleep 3
+if ! kill -0 "$PRODUCER_PID" 2>/dev/null; then
+    echo "Producer crashed. Last 20 lines of logs/producer.log:"
+    tail -20 logs/producer.log
+    exit 1
+fi
+echo "      Producer is running."
+
+# ── Spark ──────────────────────────────────────────────────────────────────────
+echo "[6/7] Starting Spark..."
+bash run_spark.sh > logs/spark.log 2>&1 &
 SPARK_PID=$!
-echo "Spark PID: $SPARK_PID"
+echo "      PID: $SPARK_PID  |  tail -f logs/spark.log"
 
-# Wait for data to start flowing
-echo "Waiting for data pipeline to initialize (10 seconds)..."
-sleep 10
+sleep 5
+if ! kill -0 "$SPARK_PID" 2>/dev/null; then
+    echo "Spark failed to start. Last 20 lines of logs/spark.log:"
+    tail -20 logs/spark.log
+    exit 1
+fi
+echo "      Spark is running."
 
-# Launch dashboard
-echo "Launching Streamlit dashboard..."
-echo "Dashboard will be available at: http://localhost:${DASHBOARD_PORT:-8501}"
-echo "Press Ctrl+C to stop all services"
+# ── Dashboard ──────────────────────────────────────────────────────────────────
+echo "[7/7] Launching dashboard..."
+echo ""
+echo "  http://localhost:$DASHBOARD_PORT"
+echo "  Ctrl+C to stop everything"
 echo ""
 
 streamlit run dashboard/app.py \
-    --server.port "${DASHBOARD_PORT:-8501}" \
+    --server.port "$DASHBOARD_PORT" \
     --server.address localhost
-
-# Cleanup on exit
-echo ""
-echo "Shutting down services..."
-kill $PRODUCER_PID 2>/dev/null
-kill $SPARK_PID 2>/dev/null
-cd kafka-setup
-docker-compose down
-echo "All services stopped"

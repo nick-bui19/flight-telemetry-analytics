@@ -205,15 +205,7 @@ def write_airspace_grid(batch_df: DataFrame, batch_id: int) -> None:
     """Append airspace grid aggregation rows via JDBC."""
     if batch_df.count() == 0:
         return
-    batch_df.write \
-        .format("jdbc") \
-        .option("url", JDBC_URL) \
-        .option("dbtable", "realtime_airspace_grid_5m") \
-        .option("user", POSTGRES_USER) \
-        .option("password", POSTGRES_PASSWORD) \
-        .option("driver", "org.postgresql.Driver") \
-        .mode("append") \
-        .save()
+    batch_df.write.jdbc(JDBC_URL, "realtime_airspace_grid_5m", mode="append", properties=JDBC_PROPS)
     logger.info("batch_id=%d wrote airspace grid rows", batch_id)
 
 
@@ -221,15 +213,7 @@ def write_quality_metrics(batch_df: DataFrame, batch_id: int) -> None:
     """Append telemetry quality rows via JDBC."""
     if batch_df.count() == 0:
         return
-    batch_df.write \
-        .format("jdbc") \
-        .option("url", JDBC_URL) \
-        .option("dbtable", "telemetry_quality_5m") \
-        .option("user", POSTGRES_USER) \
-        .option("password", POSTGRES_PASSWORD) \
-        .option("driver", "org.postgresql.Driver") \
-        .mode("append") \
-        .save()
+    batch_df.write.jdbc(JDBC_URL, "telemetry_quality_5m", mode="append", properties=JDBC_PROPS)
     logger.info("batch_id=%d wrote quality metric rows", batch_id)
 
 
@@ -248,7 +232,7 @@ def main() -> None:
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", KAFKA_TOPIC_NAME)
-        .option("startingOffsets", "latest")
+        .option("startingOffsets", "earliest")
         .load()
     )
 

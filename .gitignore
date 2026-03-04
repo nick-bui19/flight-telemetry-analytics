@@ -11,3 +11,4 @@ dashboard/README.md
 settings.local.json
 spark-checkpoints/
 spark-warehouse/
+logs/

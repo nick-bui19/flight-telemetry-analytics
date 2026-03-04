@@ -135,10 +135,21 @@ def run() -> None:
 
             # ── Fatal HTTP errors ──────────────────────────────────────────────
             if resp.status_code in _FATAL_HTTP_CODES:
-                logger.critical(
-                    "Fatal HTTP %d from OpenSky — bad credentials? Stopping.",
-                    resp.status_code,
-                )
+                if not OPENSKY_USERNAME:
+                    logger.critical(
+                        "HTTP %d from OpenSky with anonymous access — "
+                        "OpenSky now requires authentication. "
+                        "Register at opensky-network.org and set "
+                        "OPENSKY_USERNAME / OPENSKY_PASSWORD in .env.",
+                        resp.status_code,
+                    )
+                else:
+                    logger.critical(
+                        "HTTP %d from OpenSky — invalid credentials for user '%s'. "
+                        "Check OPENSKY_USERNAME / OPENSKY_PASSWORD in .env.",
+                        resp.status_code,
+                        OPENSKY_USERNAME,
+                    )
                 sys.exit(1)
 
             # ── Transient HTTP errors ─────────────────────────────────────────
