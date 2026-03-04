@@ -188,7 +188,7 @@ def upsert_flight_state(batch_df: DataFrame, batch_id: int) -> None:
             vertical_rate_mps   = EXCLUDED.vertical_rate_mps,
             on_ground           = EXCLUDED.on_ground,
             last_event_time_utc = EXCLUDED.last_event_time_utc,
-            updated_at_utc      = EXCLUDED.updated_at_utc,
+            updated_at_utc      = NOW(),
             source              = EXCLUDED.source
     """
     conn = _get_pg_conn()

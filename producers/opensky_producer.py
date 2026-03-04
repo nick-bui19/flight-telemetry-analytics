@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 # ── Config (read at module load; crash on missing required vars) ───────────────
 OPENSKY_USERNAME        = os.environ.get("OPENSKY_USERNAME", "")
 OPENSKY_PASSWORD        = os.environ.get("OPENSKY_PASSWORD", "")
+OPENSKY_CLIENT_ID       = os.environ.get("OPENSKY_CLIENT_ID", "")
+OPENSKY_CLIENT_SECRET   = os.environ.get("OPENSKY_CLIENT_SECRET", "")
 POLL_SECONDS            = float(os.environ.get("OPENSKY_POLL_SECONDS", "10"))
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC_NAME        = os.environ.get("KAFKA_TOPIC", KAFKA_TOPIC)
@@ -94,6 +96,60 @@ def _backoff_with_jitter(attempt: int) -> float:
     return delay + random.uniform(0, delay * 0.1)
 
 
+# ── OAuth2 token management ────────────────────────────────────────────────────
+_OAUTH_TOKEN_URL = (
+    "https://auth.opensky-network.org/auth/realms/opensky-network"
+    "/protocol/openid-connect/token"
+)
+_oauth_token: str = ""
+_oauth_token_expiry: float = 0.0  # epoch seconds
+
+
+def _fetch_oauth_token() -> str:
+    """Fetch a new Bearer token using client credentials. Exits on failure."""
+    global _oauth_token, _oauth_token_expiry
+    logger.info("Fetching OAuth2 Bearer token for client_id=%s", OPENSKY_CLIENT_ID)
+    try:
+        resp = requests.post(
+            _OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": OPENSKY_CLIENT_ID,
+                "client_secret": OPENSKY_CLIENT_SECRET,
+            },
+            timeout=10,
+        )
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        logger.critical("Failed to reach OAuth2 token endpoint: %s", exc)
+        sys.exit(1)
+
+    if not resp.ok:
+        logger.critical(
+            "OAuth2 token request failed HTTP %d: %s — "
+            "Check OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET in .env.",
+            resp.status_code,
+            resp.text,
+        )
+        sys.exit(1)
+
+    data = resp.json()
+    _oauth_token = data["access_token"]
+    # tokens expire in 1800s (30 min); refresh 60s early to be safe
+    _oauth_token_expiry = time.time() + data.get("expires_in", 1800) - 60
+    logger.info("OAuth2 token obtained, valid for ~%ds", data.get("expires_in", 1800))
+    return _oauth_token
+
+
+def _get_auth_headers() -> dict:
+    """Return Authorization header, refreshing token if expired."""
+    global _oauth_token, _oauth_token_expiry
+    if OPENSKY_CLIENT_ID:
+        if time.time() >= _oauth_token_expiry:
+            _fetch_oauth_token()
+        return {"Authorization": f"Bearer {_oauth_token}"}
+    return {}
+
+
 # ── Kafka setup ────────────────────────────────────────────────────────────────
 def _make_producer() -> KafkaProducer:
     """Create Kafka producer; raise on 3 consecutive connection failures (fatal)."""
@@ -126,29 +182,45 @@ def run() -> None:
     )
 
     producer = _make_producer()
-    auth: Optional[tuple[str, str]] = (OPENSKY_USERNAME, OPENSKY_PASSWORD) if OPENSKY_USERNAME else None
     transient_attempt = 0
+
+    # Validate auth config and pre-fetch token if using OAuth2
+    if OPENSKY_CLIENT_ID:
+        _fetch_oauth_token()
+    elif OPENSKY_USERNAME:
+        logger.info("Using Basic Auth for user '%s' (legacy account)", OPENSKY_USERNAME)
+    else:
+        logger.warning("No credentials set — anonymous access may be rejected by OpenSky")
 
     while True:
         try:
-            resp = requests.get(OPENSKY_API_URL, auth=auth, timeout=10)
+            if OPENSKY_CLIENT_ID:
+                resp = requests.get(OPENSKY_API_URL, headers=_get_auth_headers(), timeout=10)
+            else:
+                auth = (OPENSKY_USERNAME, OPENSKY_PASSWORD) if OPENSKY_USERNAME else None
+                resp = requests.get(OPENSKY_API_URL, auth=auth, timeout=10)
 
             # ── Fatal HTTP errors ──────────────────────────────────────────────
             if resp.status_code in _FATAL_HTTP_CODES:
-                if not OPENSKY_USERNAME:
+                if OPENSKY_CLIENT_ID:
                     logger.critical(
-                        "HTTP %d from OpenSky with anonymous access — "
-                        "OpenSky now requires authentication. "
-                        "Register at opensky-network.org and set "
-                        "OPENSKY_USERNAME / OPENSKY_PASSWORD in .env.",
+                        "HTTP %d from OpenSky with Bearer token — token may be invalid. "
+                        "Check OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET in .env.",
                         resp.status_code,
+                    )
+                elif OPENSKY_USERNAME:
+                    logger.critical(
+                        "HTTP %d from OpenSky — Basic Auth rejected for user '%s'. "
+                        "New OpenSky accounts require OAuth2: set "
+                        "OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET in .env instead.",
+                        resp.status_code,
+                        OPENSKY_USERNAME,
                     )
                 else:
                     logger.critical(
-                        "HTTP %d from OpenSky — invalid credentials for user '%s'. "
-                        "Check OPENSKY_USERNAME / OPENSKY_PASSWORD in .env.",
+                        "HTTP %d from OpenSky — anonymous access rejected. "
+                        "Set OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET in .env.",
                         resp.status_code,
-                        OPENSKY_USERNAME,
                     )
                 sys.exit(1)
 

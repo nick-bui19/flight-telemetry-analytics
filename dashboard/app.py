@@ -9,23 +9,26 @@ from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import psycopg2
+import sqlalchemy
 import streamlit as st
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DB_CONFIG = {
-    "host":     os.environ.get("POSTGRES_HOST", "localhost"),
-    "port":     os.environ.get("POSTGRES_PORT", "5432"),
-    "database": os.environ.get("POSTGRES_DB", "flight_data"),
-    "user":     os.environ.get("POSTGRES_USER", "nickbui"),
-    "password": os.environ.get("POSTGRES_PASSWORD", "dummy"),
-}
+_PG_HOST     = os.environ.get("POSTGRES_HOST", "localhost")
+_PG_PORT     = os.environ.get("POSTGRES_PORT", "5432")
+_PG_DB       = os.environ.get("POSTGRES_DB", "flight_data")
+_PG_USER     = os.environ.get("POSTGRES_USER", "nickbui")
+_PG_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "dummy")
+
+_ENGINE = sqlalchemy.create_engine(
+    f"postgresql+psycopg2://{_PG_USER}:{_PG_PASSWORD}@{_PG_HOST}:{_PG_PORT}/{_PG_DB}",
+    pool_pre_ping=True,
+)
 
 REFRESH_INTERVAL = 15  # seconds — matches live map cache TTL
 
 
 def _conn():
-    return psycopg2.connect(**DB_CONFIG)
+    return _ENGINE.connect()
 
 
 # ── Queries (all SQL-side aggregation, all with LIMIT) ────────────────────────
@@ -230,6 +233,7 @@ def main() -> None:
     # ── Auto-refresh ──────────────────────────────────────────────────────────
     if auto_refresh:
         time.sleep(REFRESH_INTERVAL)
+        st.cache_data.clear()
         st.rerun()
 
 
