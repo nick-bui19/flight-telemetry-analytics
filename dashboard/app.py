@@ -5,45 +5,59 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import sqlalchemy
 import streamlit as st
 
 # ── Config ────────────────────────────────────────────────────────────────────
+DEMO_MODE = os.environ.get("DEMO_MODE", "snapshot")  # "snapshot" | "postgres"
+
 _PG_HOST     = os.environ.get("POSTGRES_HOST", "localhost")
 _PG_PORT     = os.environ.get("POSTGRES_PORT", "5432")
 _PG_DB       = os.environ.get("POSTGRES_DB", "flight_data")
 _PG_USER     = os.environ.get("POSTGRES_USER", "nickbui")
 _PG_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "dummy")
 
-_ENGINE = sqlalchemy.create_engine(
-    f"postgresql+psycopg2://{_PG_USER}:{_PG_PASSWORD}@{_PG_HOST}:{_PG_PORT}/{_PG_DB}",
-    pool_pre_ping=True,
-)
-
 REFRESH_INTERVAL = 15  # seconds — matches live map cache TTL
 
 
 def _conn():
-    return _ENGINE.connect()
+    import sqlalchemy
+    engine = sqlalchemy.create_engine(
+        f"postgresql+psycopg2://{_PG_USER}:{_PG_PASSWORD}@{_PG_HOST}:{_PG_PORT}/{_PG_DB}",
+        pool_pre_ping=True,
+    )
+    return engine.connect()
 
 
-# ── Queries (all SQL-side aggregation, all with LIMIT) ────────────────────────
+def _load_table(name: str, _snapshot_dir: Path | None = None) -> pd.DataFrame:
+    """Load a table from parquet snapshot or live Postgres depending on DEMO_MODE.
+
+    _snapshot_dir is for testing only; pass tmp_path to override default location.
+    """
+    if os.environ.get("DEMO_MODE", "snapshot") == "snapshot":
+        snap_dir = _snapshot_dir or (Path(__file__).parent / "data")
+        return pd.read_parquet(snap_dir / f"{name}.parquet")
+    with _conn() as conn:
+        import sqlalchemy
+        return pd.read_sql_table(name, conn)
+
+
+# ── Queries ───────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=15)
 def get_live_map_data() -> pd.DataFrame:
-    sql = """
-        SELECT icao24, callsign, lat, lon, altitude_m, velocity_mps, heading_deg, updated_at_utc
-        FROM realtime_flight_state
-        WHERE updated_at_utc >= NOW() - INTERVAL '5 minutes'
-          AND lat IS NOT NULL AND lon IS NOT NULL
-    """
     try:
-        with _conn() as conn:
-            return pd.read_sql_query(sql, conn)
+        df = _load_table("realtime_flight_state")
+        df = df[df["lat"].notna() & df["lon"].notna()]
+        # Time filter only in postgres mode — snapshot returns all rows
+        if os.environ.get("DEMO_MODE", "snapshot") != "snapshot":
+            cutoff = pd.Timestamp.utcnow() - pd.Timedelta(minutes=5)
+            df = df[pd.to_datetime(df["updated_at_utc"], utc=True) >= cutoff]
+        return df[["icao24", "callsign", "lat", "lon", "altitude_m", "velocity_mps", "heading_deg", "updated_at_utc"]]
     except Exception as exc:
         st.error(f"DB error (live map): {exc}")
         return pd.DataFrame()
@@ -51,29 +65,11 @@ def get_live_map_data() -> pd.DataFrame:
 
 @st.cache_data(ttl=30)
 def get_leaderboards() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    sql_speed = """
-        SELECT icao24, callsign, velocity_mps
-        FROM realtime_flight_state
-        ORDER BY velocity_mps DESC NULLS LAST
-        LIMIT 10
-    """
-    sql_alt = """
-        SELECT icao24, callsign, altitude_m
-        FROM realtime_flight_state
-        ORDER BY altitude_m DESC NULLS LAST
-        LIMIT 10
-    """
-    sql_vrate = """
-        SELECT icao24, callsign, vertical_rate_mps
-        FROM realtime_flight_state
-        ORDER BY vertical_rate_mps DESC NULLS LAST
-        LIMIT 10
-    """
     try:
-        with _conn() as conn:
-            df_speed = pd.read_sql_query(sql_speed, conn)
-            df_alt   = pd.read_sql_query(sql_alt,   conn)
-            df_vrate = pd.read_sql_query(sql_vrate, conn)
+        df = _load_table("realtime_flight_state")
+        df_speed = df[["icao24", "callsign", "velocity_mps"]].sort_values("velocity_mps", ascending=False, na_position="last").head(10)
+        df_alt   = df[["icao24", "callsign", "altitude_m"]].sort_values("altitude_m", ascending=False, na_position="last").head(10)
+        df_vrate = df[["icao24", "callsign", "vertical_rate_mps"]].sort_values("vertical_rate_mps", ascending=False, na_position="last").head(10)
         return df_speed, df_alt, df_vrate
     except Exception as exc:
         st.error(f"DB error (leaderboards): {exc}")
@@ -83,14 +79,10 @@ def get_leaderboards() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 @st.cache_data(ttl=30)
 def get_heatmap_data() -> pd.DataFrame:
-    sql = """
-        SELECT grid_cell, aircraft_count, avg_altitude_m
-        FROM realtime_airspace_grid_5m
-        WHERE window_end = (SELECT MAX(window_end) FROM realtime_airspace_grid_5m)
-    """
     try:
-        with _conn() as conn:
-            return pd.read_sql_query(sql, conn)
+        df = _load_table("realtime_airspace_grid_5m")
+        latest = df["window_end"].max()
+        return df[df["window_end"] == latest][["grid_cell", "aircraft_count", "avg_altitude_m"]]
     except Exception as exc:
         st.error(f"DB error (heatmap): {exc}")
         return pd.DataFrame()
@@ -98,14 +90,9 @@ def get_heatmap_data() -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def get_quality_data() -> pd.DataFrame:
-    sql = """
-        SELECT * FROM telemetry_quality_5m
-        ORDER BY window_end DESC
-        LIMIT 12
-    """
     try:
-        with _conn() as conn:
-            return pd.read_sql_query(sql, conn)
+        df = _load_table("telemetry_quality_5m")
+        return df.sort_values("window_end", ascending=False).head(12)
     except Exception as exc:
         st.error(f"DB error (quality): {exc}")
         return pd.DataFrame()
@@ -127,16 +114,29 @@ def main() -> None:
     # Sidebar
     st.sidebar.header("Controls")
     auto_refresh = st.sidebar.checkbox("Auto-refresh (15s)", value=True)
-    st.sidebar.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')}")
+
+    # Fetch early — cached, so safe to call once here and reuse below
+    map_df = get_live_map_data()
+
+    # ── Top KPIs ──────────────────────────────────────────────────────────────
+    kpi_left, kpi_right = st.columns(2)
+    with kpi_left:
+        st.metric("Tracked aircraft", len(map_df))
+    with kpi_right:
+        if not map_df.empty and "updated_at_utc" in map_df.columns:
+            last_ts = pd.to_datetime(map_df["updated_at_utc"], utc=True).max()
+            st.metric("Last data update", last_ts.strftime("%H:%M:%S UTC"))
+        else:
+            st.metric("Last data update", datetime.now().strftime("%H:%M:%S UTC"))
+
+    st.divider()
 
     # ── Section 1: Live Map ───────────────────────────────────────────────────
     st.subheader("Live Flight Map")
-    map_df = get_live_map_data()
 
     if map_df.empty:
         st.info("No active flights in the last 5 minutes. Ensure the pipeline is running.")
     else:
-        st.caption(f"{len(map_df)} aircraft tracked")
         fig_map = px.scatter_geo(
             map_df,
             lat="lat",
@@ -190,7 +190,6 @@ def main() -> None:
     if heatmap_df.empty:
         st.info("No airspace grid data yet. Spark aggregations may still be initializing.")
     else:
-        # Parse grid_cell "lat_lon" → numeric columns for scatter
         try:
             heatmap_df[["grid_lat", "grid_lon"]] = heatmap_df["grid_cell"].str.split("_", expand=True).astype(float)
             fig_heat = px.scatter_geo(
@@ -218,7 +217,6 @@ def main() -> None:
     if quality_df.empty:
         st.info("No quality metrics yet.")
     else:
-        # Summary metrics from most recent window
         latest = quality_df.iloc[0]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total messages", int(latest.get("total_messages", 0)))
