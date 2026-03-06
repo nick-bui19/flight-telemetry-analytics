@@ -5,6 +5,11 @@
 
 ---
 
+## Demo
+https://flight-telemetry-analytics-jcqx4svd9ajvmurfbfkqrx.streamlit.app/
+
+---
+
 ## Architecture
 
 ```
