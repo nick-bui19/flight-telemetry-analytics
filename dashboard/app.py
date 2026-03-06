@@ -110,8 +110,8 @@ def main() -> None:
 
     st.title("✈ Real-Time Flight Telemetry Dashboard")
     st.caption(
-        "Live monitoring of flight positions, speeds, and airspace density — "
-        "powered by OpenSky ADS-B data, not a complete picture of all flights. "
+        "Live monitoring of flight positions, speeds, and airspace density. This app is"
+        "powered by OpenSky ADS-B data and is not a complete picture of all flights. "
         "ADS-B Out has been required for most commercial and general aviation aircraft "
         "in controlled airspace since January 2020. Military aircraft, some older GA "
         "planes, and drones are generally excluded."
