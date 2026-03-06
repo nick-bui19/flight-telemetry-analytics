@@ -109,11 +109,44 @@ def main() -> None:
     )
 
     st.title("✈ Real-Time Flight Telemetry Dashboard")
-    st.caption("Live monitoring of flight positions, speeds, and airspace density")
+    st.caption(
+        "Live monitoring of flight positions, speeds, and airspace density — "
+        "powered by OpenSky ADS-B data, not a complete picture of all flights. "
+        "ADS-B Out has been required for most commercial and general aviation aircraft "
+        "in controlled airspace since January 2020. Military aircraft, some older GA "
+        "planes, and drones are generally excluded."
+    )
 
     # Sidebar
     st.sidebar.header("Controls")
     auto_refresh = st.sidebar.checkbox("Auto-refresh (15s)", value=True)
+    unit_system = st.sidebar.radio("Units", ["Imperial", "Metric"], index=0, horizontal=True)
+    imperial = unit_system == "Imperial"
+
+    # Unit labels and converters
+    vel_unit   = "mph"     if imperial else "m/s"
+    alt_unit   = "ft"      if imperial else "m"
+    vrate_unit = "ft/min"  if imperial else "m/s"
+
+    vel_label   = f"Velocity ({vel_unit})"
+    alt_label   = f"Altitude ({alt_unit})"
+    vrate_label = f"Vertical Rate ({vrate_unit})"
+
+    def to_vel(s):   return s * 2.23694 if imperial else s
+    def to_alt(m):   return m * 3.28084 if imperial else m
+    def to_vrate(s): return s * 196.85  if imperial else s
+
+    # Tooltip text for leaderboard columns
+    _icao_help = (
+        "A unique 24-bit identifier assigned to each aircraft's transponder by its "
+        "country's aviation authority (e.g. the FAA in the US). It's the aircraft's "
+        "permanent hardware fingerprint — unlike a callsign, it never changes."
+    )
+    _callsign_help = (
+        "The flight identifier used by air traffic control. For commercial flights "
+        "this is typically the airline code + flight number (e.g. AAL123). "
+        "Changes each flight, unlike the ICAO24 which is tied to the aircraft."
+    )
 
     # Fetch early — cached, so safe to call once here and reuse below
     map_df = get_live_map_data()
@@ -137,15 +170,18 @@ def main() -> None:
     if map_df.empty:
         st.info("No active flights in the last 5 minutes. Ensure the pipeline is running.")
     else:
+        map_display = map_df.copy()
+        map_display[alt_label] = to_alt(map_display["altitude_m"])
+        map_display[vel_label] = to_vel(map_display["velocity_mps"])
+
         fig_map = px.scatter_geo(
-            map_df,
+            map_display,
             lat="lat",
             lon="lon",
             hover_name="callsign",
-            hover_data={"icao24": True, "altitude_m": True, "velocity_mps": True, "heading_deg": True},
-            color="altitude_m",
+            hover_data={"icao24": True, alt_label: True, vel_label: True, "heading_deg": True},
+            color=alt_label,
             color_continuous_scale="Viridis",
-            labels={"altitude_m": "Altitude (m)"},
             scope="usa",
             title="Active Flights (last 5 min)",
             height=450,
@@ -161,23 +197,56 @@ def main() -> None:
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown("**Fastest (m/s)**")
+        st.markdown(f"**Fastest ({vel_unit})**")
         if not df_speed.empty:
-            st.dataframe(df_speed, use_container_width=True, hide_index=True)
+            disp = df_speed.copy()
+            disp["velocity_mps"] = to_vel(disp["velocity_mps"]).round(1)
+            st.dataframe(
+                disp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "icao24": st.column_config.TextColumn("ICAO24", help=_icao_help),
+                    "callsign": st.column_config.TextColumn("Callsign", help=_callsign_help),
+                    "velocity_mps": st.column_config.NumberColumn(vel_label, format="%.1f"),
+                },
+            )
         else:
             st.info("No data")
 
     with col2:
-        st.markdown("**Highest altitude (m)**")
+        st.markdown(f"**Highest altitude ({alt_unit})**")
         if not df_alt.empty:
-            st.dataframe(df_alt, use_container_width=True, hide_index=True)
+            disp = df_alt.copy()
+            disp["altitude_m"] = to_alt(disp["altitude_m"]).round(0)
+            st.dataframe(
+                disp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "icao24": st.column_config.TextColumn("ICAO24", help=_icao_help),
+                    "callsign": st.column_config.TextColumn("Callsign", help=_callsign_help),
+                    "altitude_m": st.column_config.NumberColumn(alt_label, format="%.0f"),
+                },
+            )
         else:
             st.info("No data")
 
     with col3:
-        st.markdown("**Top climb rate (m/s)**")
+        st.markdown(f"**Top climb rate ({vrate_unit})**")
         if not df_vrate.empty:
-            st.dataframe(df_vrate, use_container_width=True, hide_index=True)
+            disp = df_vrate.copy()
+            disp["vertical_rate_mps"] = to_vrate(disp["vertical_rate_mps"]).round(1)
+            st.dataframe(
+                disp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "icao24": st.column_config.TextColumn("ICAO24", help=_icao_help),
+                    "callsign": st.column_config.TextColumn("Callsign", help=_callsign_help),
+                    "vertical_rate_mps": st.column_config.NumberColumn(vrate_label, format="%.1f"),
+                },
+            )
         else:
             st.info("No data")
 
@@ -192,6 +261,7 @@ def main() -> None:
     else:
         try:
             heatmap_df[["grid_lat", "grid_lon"]] = heatmap_df["grid_cell"].str.split("_", expand=True).astype(float)
+            heatmap_df[alt_label] = to_alt(heatmap_df["avg_altitude_m"])
             fig_heat = px.scatter_geo(
                 heatmap_df,
                 lat="grid_lat",
@@ -199,7 +269,7 @@ def main() -> None:
                 size="aircraft_count",
                 color="aircraft_count",
                 color_continuous_scale="Reds",
-                hover_data={"grid_cell": True, "avg_altitude_m": True},
+                hover_data={"grid_cell": True, alt_label: True},
                 scope="usa",
                 title="Aircraft density by grid cell",
                 height=400,
